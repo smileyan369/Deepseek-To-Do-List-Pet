@@ -1,0 +1,85 @@
+{
+  "id": "deepsea-maid",
+  "name": "\u6df1\u6d77\u5973\u4ec6",
+  "size": [112, 154],
+  "cell_size": [256, 352],
+  "anchor": [56, 149],
+  "hit_area": [8, 5, 96, 144],
+  "theme": {
+    "navy": "#132a56",
+    "indigo": "#3857a5",
+    "light_blue": "#9fd9f3",
+    "accent": "#35c9d0",
+    "white": "#f7fbff"
+  },
+  "states": {
+    "idle": {
+      "frames": ["deepseek/idle.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [700, 360, 360, 760],
+      "loop": true
+    },
+    "running_right": {
+      "frames": ["deepseek/running_right.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [120, 120, 120, 160],
+      "loop": true
+    },
+    "running_left": {
+      "frames": ["deepseek/running_left.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [120, 120, 120, 160],
+      "loop": true
+    },
+    "waving": {
+      "frames": ["deepseek/waving.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [360, 420, 460, 700],
+      "loop": false
+    },
+    "jumping": {
+      "frames": ["deepseek/jumping.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [130, 150, 180, 260],
+      "loop": false
+    },
+    "failed": {
+      "frames": ["deepseek/failed.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [120, 120, 120, 200],
+      "loop": false
+    },
+    "waiting": {
+      "frames": ["deepseek/waiting.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [460, 460, 420, 720],
+      "loop": false
+    },
+    "working": {
+      "frames": ["deepseek/working.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [160, 160, 160, 220],
+      "loop": false
+    },
+    "review": {
+      "frames": ["deepseek/review.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [320, 400, 460, 700],
+      "loop": false
+    },
+    "sleeping": {
+      "frames": ["deepseek/sleeping.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [260, 300, 340, 500],
+      "loop": false
+    },
+    "waking": {
+      "frames": ["deepseek/waking.png"],
+      "frames_per_strip": 4,
+      "durations_ms": [360, 300, 260, 260],
+      "loop": false
+    }
+  },
+  "random_action_seconds": [6, 10],
+  "random_actions": ["idle", "waving", "waiting"]
+}
