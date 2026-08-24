@@ -185,6 +185,17 @@ class UiTests(unittest.TestCase):
             pet.hide_all(); self.assertTrue(pet.settings["hidden"]); self.assertFalse(pet.isVisible())
             pet.show_all(); self.assertFalse(pet.settings["hidden"]); pet.tray.hide(); pet.close()
 
+    def test_autostart_launch_always_resets_hidden_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = DataStore(folder)
+            store.save([], {"hidden": True, "autostart": False, "pet_position": None})
+            pet = PetWindow(store, startup_launch=True); app.processEvents()
+            self.assertTrue(pet.isVisible())
+            self.assertFalse(pet.settings["hidden"])
+            _, restored_settings = store.load()
+            self.assertFalse(restored_settings["hidden"])
+            pet.tray.hide(); pet.close()
+
     def test_workshop_strip_pack_can_replace_character(self):
         with tempfile.TemporaryDirectory() as folder:
             pack = self._make_strip_pack(folder)

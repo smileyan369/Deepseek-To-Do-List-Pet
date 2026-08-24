@@ -23,10 +23,14 @@ from core.store import DataStore
 
 class PetWindow(QWidget):
     """Non-activating transparent shell; child overlays live in separate Tool windows."""
-    def __init__(self, store: DataStore | None = None):
+    def __init__(self, store: DataStore | None = None, startup_launch: bool = False):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground); self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.store = store or DataStore(); self.tasks, self.settings = self.store.load()
+        # A Windows logon launch must always make the pet visible. Hidden state
+        # is still persisted for ordinary manual restarts.
+        if startup_launch:
+            self.settings["hidden"] = False
         self.chat_config_store = ChatConfigStore(self.store.data_dir); self.chat_config = self.chat_config_store.load()
         self.chat_memory = ChatMemory(self.store.data_dir); self.chat_active = False; self.chat_runner = None; self.chat_received = False
         self.character_roots = self._character_roots()
@@ -44,6 +48,8 @@ class PetWindow(QWidget):
         self.hide_timer = QTimer(self); self.hide_timer.setSingleShot(True); self.hide_timer.timeout.connect(self._hide_overlays_if_outside)
         self.tick_timer = QTimer(self); self.tick_timer.timeout.connect(self._tick); self.tick_timer.start(250)
         self._restore_position(); self._create_tray(); self.refresh()
+        if startup_launch:
+            self._save()
         if self.settings.get("autostart"):
             # Refresh the command after executable moves or product renames.
             self.settings["autostart"] = self._set_autostart(True)
@@ -337,7 +343,7 @@ class PetWindow(QWidget):
         try:
             import winreg
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, winreg.KEY_SET_VALUE)
-            command = f'"{sys.executable}"' if getattr(sys, "frozen", False) else f'"{sys.executable}" "{Path(__file__).parent.parent / "main.py"}"'
+            command = f'"{sys.executable}" --autostart' if getattr(sys, "frozen", False) else f'"{sys.executable}" "{Path(__file__).parent.parent / "main.py"}" --autostart'
             if enabled: winreg.SetValueEx(key, "DeepSeaTodoPet", 0, winreg.REG_SZ, command)
             else:
                 try: winreg.DeleteValue(key, "DeepSeaTodoPet")
@@ -357,7 +363,7 @@ def run():
         return
     app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False); app.setApplicationName("待办桌宠")
     app.setWindowIcon(QIcon(str(asset_path("assets/app-icon.png"))))
-    window = PetWindow(); app.aboutToQuit.connect(window.tray.hide)
+    window = PetWindow(startup_launch="--autostart" in sys.argv[1:]); app.aboutToQuit.connect(window.tray.hide)
     visibility_hotkey = GlobalVisibilityHotkey(app, window.toggle_hidden)
     if not visibility_hotkey.register():
         window.tray.showMessage("快捷键不可用", "Ctrl+Shift+Z 已被其他程序占用，桌宠仍可通过托盘显示或隐藏。", QSystemTrayIcon.Warning, 4000)
