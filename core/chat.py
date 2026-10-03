@@ -18,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
+from .runtime_guard import removed_runtime_hint, was_runtime_removed
+
 
 SYSTEM_PROMPT = """你正在作为用户桌面上的日常聊天伙伴，与用户进行自然、普通的人际对话。
 回复应简短、口语化、温和，通常使用一到三句话；除非用户明确要求详细说明，否则不要列提纲、写长篇说明或重复问题。
@@ -28,8 +30,8 @@ SYSTEM_PROMPT = """你正在作为用户桌面上的日常聊天伙伴，与用�
 
 @dataclass(frozen=True)
 class ChatConfig:
-    base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-4o-mini"
+    base_url: str = "https://api.deepseek.com/v1"
+    model: str = "deepseek-flash"
     api_key: str = ""
     web_search: bool = True
     search_api_key: str = ""
@@ -168,8 +170,8 @@ class ChatConfigStore:
                 api_key = _unprotect_secret(stored_key) or self._read_credential()
             search_api_key = _unprotect_secret(str(raw.get("search_api_key", "")))
             return ChatConfig(
-                str(raw.get("base_url", "https://api.openai.com/v1")),
-                str(raw.get("model", "gpt-4o-mini")),
+                str(raw.get("base_url", "https://api.deepseek.com/v1")),
+                str(raw.get("model", "deepseek-flash")),
                 api_key,
                 bool(raw.get("web_search", True)),
                 search_api_key,
@@ -277,6 +279,9 @@ def needs_web_search(text: str) -> bool:
         "搜索", "搜一下", "查一下", "查资料", "联网", "网上", "最新",
         "新闻", "天气", "价格", "汇率", "官网", "实时", "近期", "current", "latest",
         "比赛", "赛事", "比分", "赛程", "战绩", "news", "weather", "price", "search", "online",
+        # Phrasings that ask for fresh facts without naming a search verb.
+        "最近", "目前", "这两天", "这几天", "什么时候", "进展", "发布", "上线",
+        "排行榜", "榜首", "股价", "谁赢", "结果如何", "多少了",
     )
     return any(marker in lowered for marker in markers)
 
@@ -286,6 +291,11 @@ def is_current_time_query(text: str) -> bool:
     lowered = text.lower().replace(" ", "")
     markers = ("现在时间", "当前时间", "现在几点", "现在几时", "当地时间", "北京时间", "what time is it", "current time")
     return any(marker in lowered for marker in markers)
+
+
+def _strip_html(text: str) -> str:
+    """Plain text from a feed description or snippet, with tidy spacing."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or "")).strip()
 
 
 def _search_query(query: str) -> str:
@@ -410,6 +420,100 @@ class _BingParser(HTMLParser):
             self._inside_result = False; self._capture = ""; self._h2_depth = 0
 
 
+class BingRssSearchClient:
+    """Bing's RSS output: the same index as the HTML page without the scraping.
+
+    Verified 2026-10-04: it answers every query tested (including the ones the
+    HTML page renders without a parsable result list) in about half a second.
+    """
+    endpoint = "https://www.bing.com/search"
+
+    def search(self, query: str, limit: int = 5) -> list[dict[str, str]]:
+        url = f"{self.endpoint}?q={quote_plus(_search_query(query))}&format=rss"
+        request = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        try:
+            with urlopen(request, timeout=15) as response:
+                root = ElementTree.fromstring(response.read())
+        except ElementTree.ParseError as exc:
+            raise ChatApiError(f"Bing RSS 返回了无法解析的内容：{exc}") from exc
+        except OSError as exc:
+            raise ChatApiError(f"Bing RSS 搜索源不可用：{exc}") from exc
+        results = []
+        for item in root.iter("item"):
+            title = unescape((item.findtext("title") or "").strip())
+            link = (item.findtext("link") or "").strip()
+            summary = unescape(_strip_html(item.findtext("description") or "")).strip()
+            if title and link:
+                results.append({"title": title, "url": link, "summary": summary})
+        return results[:limit]
+
+
+class _So360Parser(HTMLParser):
+    """360 搜索 result list. The visible href is a redirect; data-mdurl is the
+    real address, so prefer it."""
+
+    def __init__(self):
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self._capture = ""
+        self._title = ""
+        self._url = ""
+        self._summary = ""
+        self._in_title = False
+        self._current: dict[str, str] | None = None
+
+    def _flush(self):
+        if self._current is not None:
+            self.results.append(self._current); self._current = None
+
+    def handle_starttag(self, tag, attrs):
+        data = dict(attrs); classes = (data.get("class") or "").split()
+        if tag == "h3" and "res-title" in classes:
+            self._flush(); self._in_title = True; self._title = ""; self._url = ""
+        elif self._in_title and tag == "a" and not self._url:
+            self._url = data.get("data-mdurl") or data.get("href", "")
+            self._capture = "title"
+        elif tag == "p" and "res-desc" in classes:
+            self._summary = ""; self._capture = "summary"
+
+    def handle_data(self, data):
+        if self._capture == "title": self._title += data
+        elif self._capture == "summary": self._summary += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._capture == "title":
+            self._capture = ""; self._in_title = False
+            if self._title.strip() and self._url:
+                self._current = {"title": unescape(self._title).strip(), "url": self._url, "summary": ""}
+        elif tag == "p" and self._capture == "summary":
+            self._capture = ""
+            if self._current is not None:
+                self._current["summary"] = unescape(self._summary).strip()
+
+    def close(self):
+        super().close(); self._flush()
+
+
+class So360SearchClient:
+    """No-key Chinese engine used before the challenge-prone DuckDuckGo fallback."""
+    endpoint = "https://www.so.com/s"
+
+    def search(self, query: str, limit: int = 5) -> list[dict[str, str]]:
+        request = Request(self.endpoint + "?q=" + quote_plus(_search_query(query)), headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        try:
+            with urlopen(request, timeout=15) as response:
+                parser = _So360Parser(); parser.feed(response.read().decode("utf-8", errors="replace")); parser.close()
+        except OSError as exc:
+            raise ChatApiError(f"360 搜索源不可用：{exc}") from exc
+        return [item for item in parser.results if item["url"].startswith("http")][:limit]
+
+
 class BingSearchClient:
     """No-key Bing HTML search used before the challenge-prone DDG fallback."""
     endpoint = "https://www.bing.com/search?q="
@@ -428,34 +532,34 @@ class BingSearchClient:
 
 
 class WebSearchClient:
-    """Tavily first, then no-key Bing and DuckDuckGo public fallbacks."""
+    """Tavily first, then no-key public sources, best-relevance first.
+
+    Order measured 2026-10-04 with Chinese queries: 360 answers with the page the
+    question is about; Bing's index returned unrelated pages for the same queries
+    from this network and sometimes no parsable list at all; DuckDuckGo currently
+    replies to no-key requests with a captcha challenge, so it stays last.
+    """
     def __init__(self, tavily_api_key: str = ""):
         self.tavily_api_key = tavily_api_key
 
+    def sources(self) -> list[tuple[str, object]]:
+        clients: list[tuple[str, object]] = []
+        if self.tavily_api_key:
+            clients.append(("Tavily", TavilySearchClient(self.tavily_api_key)))
+        clients.extend((("360 搜索", So360SearchClient()), ("Bing RSS", BingRssSearchClient()),
+                        ("Bing", BingSearchClient()), ("DuckDuckGo", DuckDuckGoSearchClient())))
+        return clients
+
     def search(self, query: str, limit: int = 5) -> list[dict[str, str]]:
         errors = []
-        if self.tavily_api_key:
+        for name, client in self.sources():
             try:
-                results = TavilySearchClient(self.tavily_api_key).search(query, limit)
+                results = client.search(query, limit)
                 if results:
                     return results
-                errors.append("Tavily 未返回结果")
+                errors.append(f"{name} 未返回结果")
             except ChatApiError as exc:
                 errors.append(str(exc))
-        try:
-            results = BingSearchClient().search(query, limit)
-            if results:
-                return results
-            errors.append("Bing 公共搜索源未返回结果")
-        except ChatApiError as exc:
-            errors.append(str(exc))
-        try:
-            results = DuckDuckGoSearchClient().search(query, limit)
-            if results:
-                return results
-            errors.append("免费公共搜索源未返回结果")
-        except ChatApiError as exc:
-            errors.append(str(exc))
         raise ChatApiError("；".join(errors) or "没有可用的搜索结果")
 
 
@@ -536,4 +640,6 @@ class OpenAICompatibleClient:
                 detail = ""
             raise ChatApiError(f"API 请求失败（HTTP {exc.code}）{': ' + detail if detail else ''}") from exc
         except (URLError, TimeoutError, OSError) as exc:
-            raise ChatApiError(f"无法连接聊天 API：{exc}") from exc
+            # A temp cleaner that emptied sys._MEIPASS surfaces here as Errno 2 on
+            # base_library.zip; report it as something the user can act on.
+            raise ChatApiError(f"无法连接聊天 API：{removed_runtime_hint() if was_runtime_removed(exc) else exc}") from exc

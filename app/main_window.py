@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QPoint, QTimer, Qt
 from PySide6.QtGui import QAction, QCursor, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QWidget
+from app.balance_views import BalanceBubble, BalanceRunner
 from app.character import CharacterWidget, asset_path
 from app.chat_views import ActionChooser, ApiConfigDialog, ChatInputPanel, ChatRunner, SpeechBubble
 from app.global_hotkey import GlobalVisibilityHotkey
@@ -19,6 +20,12 @@ from core.models import Task, sorted_tasks
 from core.positioning import Rect, fit_overlay_position, restore_position
 from core.single_instance import SingleInstanceGuard
 from core.store import DataStore
+
+
+# A hover shows the last value instantly and re-queries in the background, so this
+# only caps how often a burst of hovers can hit the API. The official balance moves
+# within seconds, and a long cache made the bubble disagree with the console.
+BALANCE_TTL_SECONDS = 20
 
 
 class PetWindow(QWidget):
@@ -39,11 +46,12 @@ class PetWindow(QWidget):
         self.machine = AnimationStateMachine(); self.character = CharacterWidget(self, selected_pack); self.setFixedSize(*self.character.SIZE); self.character.installEventFilter(self)
         self.character.hovered.connect(self._hovered); self.list = TaskList(); self.editor = TaskEditor()
         self.chooser = ActionChooser(); self.chat_input = ChatInputPanel(); self.bubble = SpeechBubble()
+        self.balance_bubble = BalanceBubble(); self.balance = None; self.balance_error = ""; self.balance_fetched_at = 0.0; self.balance_runner = None
         self.list.edit_requested.connect(self.edit_task); self.list.delete_requested.connect(self.delete_task); self.list.complete_requested.connect(self.complete_task)
         self.editor.saved.connect(self.save_editor); self.editor.validation_failed.connect(lambda: self.character.play_once("failed")); self.list.activity.connect(self._schedule_hide); self.editor.activity.connect(self._schedule_hide)
         self.chooser.chat_selected.connect(self.open_chat); self.chooser.task_selected.connect(self.open_new); self.chooser.activity.connect(self._schedule_hide)
         self.chat_input.send_requested.connect(self.send_chat); self.chat_input.close_requested.connect(self.end_chat); self.chat_input.activity.connect(self._schedule_hide)
-        self.press_at = 0; self.press_pos = QPoint(); self.long_started = False; self.drag_offset = QPoint()
+        self.press_at = 0; self.press_pos = QPoint(); self.long_started = False; self.drag_offset = QPoint(); self.panel_offsets = []
         self.long_press_timer = QTimer(self); self.long_press_timer.setSingleShot(True); self.long_press_timer.timeout.connect(self._begin_long_press)
         self.hide_timer = QTimer(self); self.hide_timer.setSingleShot(True); self.hide_timer.timeout.connect(self._hide_overlays_if_outside)
         self.tick_timer = QTimer(self); self.tick_timer.timeout.connect(self._tick); self.tick_timer.start(250)
@@ -146,50 +154,106 @@ class PetWindow(QWidget):
     def refresh(self): self.list.set_tasks(sorted_tasks(self.tasks))
 
     def eventFilter(self, watched, event):
-        if self.chat_active and watched is self.character and event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
-            return True
         if watched is self.character:
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
                 self.long_press_timer.stop(); self.press_at = 0; return True
             if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.RightButton:
-                self.hide_overlays(); self.pet_menu.exec(event.globalPosition().toPoint()); return True
+                # A chat session outlives its context menu: closing it here would end the chat.
+                if not self.chat_active: self.hide_overlays()
+                self.pet_menu.exec(event.globalPosition().toPoint()); return True
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                self.press_at = time.monotonic_ns() // 1_000_000; self.press_pos = event.globalPosition().toPoint(); self.long_started = False; self.long_press_timer.start(200); self.hide_overlays(); self._interact(); return True
+                self.press_at = time.monotonic_ns() // 1_000_000; self.press_pos = event.globalPosition().toPoint(); self.long_started = False; self.long_press_timer.start(200)
+                if not self.chat_active: self.hide_overlays(); self._interact()
+                return True
             if event.type() == QEvent.MouseMove and self.press_at:
                 now = time.monotonic_ns() // 1_000_000
                 distance = (event.globalPosition().toPoint() - self.press_pos).manhattanLength()
                 if not self.long_started and (now - self.press_at >= 200 or distance >= 6): self._begin_long_press()
                 if self.long_started:
                     target = event.globalPosition().toPoint() - self.drag_offset
-                    if target.x() < self.x(): self.character.force_state("running_left")
-                    elif target.x() > self.x(): self.character.force_state("running_right")
-                    self.move(target); return True
+                    before = self.pos(); self.move(target)
+                    # Chatting keeps its pose: the pet slides without the running animation.
+                    if not self.chat_active:
+                        if target.x() < before.x(): self.character.force_state("running_left")
+                        elif target.x() > before.x(): self.character.force_state("running_right")
+                    self._follow_panels(self.x() - before.x(), self.y() - before.y()); return True
             if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
                 now = time.monotonic_ns() // 1_000_000; distance = (event.globalPosition().toPoint() - self.press_pos).manhattanLength(); result = classify_press(now - self.press_at, distance, self.long_started)
                 self.press_at = 0; self.long_press_timer.stop()
-                if result.kind == "click": self.open_mode_chooser()
-                if result.kind == "drag": self.machine.drag(False, now); self.character.force_state("idle"); self.settings["pet_position"] = [self.x(), self.y()]; self._save()
+                if result.kind == "click" and not self.chat_active: self.open_mode_chooser()
+                if result.kind == "drag":
+                    if not self.chat_active:
+                        self.machine.drag(False, now); self.character.force_state("idle")
+                    self.settings["pet_position"] = [self.x(), self.y()]; self._save()
                 return True
         return super().eventFilter(watched, event)
 
     def _begin_long_press(self):
         if not self.press_at or self.long_started: return
-        self.long_started = True; self.drag_offset = QCursor.pos() - self.pos()
+        # Anchor the drag to where the press landed, not to the live pointer: the
+        # two agree in normal use, and the press point is the honest reference.
+        self.long_started = True; self.drag_offset = self.press_pos - self.pos()
+        self._begin_panel_follow()
+        if self.chat_active: return
         self.machine.drag(True, time.monotonic_ns() // 1_000_000)
         # Directional running starts on the first actual move; the pressed pet
         # remains standing while the pointer has not moved yet.
         self.character.force_state("idle")
 
+    def _begin_panel_follow(self):
+        """Freeze where the open panels sit relative to the pet, so the whole ui
+        can travel with it instead of being left behind."""
+        self.panel_offsets = [(widget, widget.x() - self.x(), widget.y() - self.y())
+                              for widget in (self.list, self.editor, self.chooser, self.chat_input)
+                              if widget.isVisible()]
+
+    def _follow_panels(self, dx: int, dy: int):
+        screen = self._screen_rect()
+        for widget, offset_x, offset_y in self.panel_offsets:
+            if widget.isVisible(): self._move_visible(widget, self.x() + offset_x, self.y() + offset_y, screen)
+        self.bubble.nudge(dx, dy)
+        if self.balance_bubble.isVisible(): self._place_balance_bubble()
+
     def _hovered(self, inside: bool):
         self._interact()
-        if inside and not any((self.editor.isVisible(), self.chooser.isVisible(), self.chat_active)): self.show_list()
+        if inside and not any((self.editor.isVisible(), self.chooser.isVisible(), self.chat_active)):
+            self.show_list(); self.show_balance()
         elif not inside: self._schedule_hide()
+
+    def show_balance(self):
+        """Show the cached balance at once, then refresh it when it is stale."""
+        if self.editor.isVisible() or self.chooser.isVisible() or self.chat_active or self.settings.get("hidden"): return
+        if self.balance is None and not self.balance_error: self.balance_bubble.show_loading()
+        else: self.balance_bubble.set_balance(self.balance, self.balance_error)
+        self._place_balance_bubble(); self.balance_bubble.show(); self.balance_bubble.raise_()
+        self.refresh_balance_if_stale()
+
+    def refresh_balance_if_stale(self, force: bool = False):
+        if self.balance_runner is not None: return
+        fresh = (self.balance is not None or self.balance_error) and (time.monotonic() - self.balance_fetched_at) < BALANCE_TTL_SECONDS
+        if fresh and not force: return
+        self.balance_runner = BalanceRunner(self.chat_config_store.load())
+        self.balance_runner.loaded.connect(self._balance_loaded); self.balance_runner.start()
+
+    def _balance_loaded(self, balance, error):
+        self.balance_runner = None; self.balance = balance; self.balance_error = error
+        self.balance_fetched_at = time.monotonic()
+        if not self.balance_bubble.isVisible(): return
+        self.balance_bubble.set_balance(balance, error); self._place_balance_bubble()
+
+    def _place_balance_bubble(self):
+        screen = self._screen_rect()
+        pet = Rect(self.x(), self.y(), self.width(), self.height())
+        blocked = [Rect(self.list.x(), self.list.y(), self.list.width(), self.list.height())] if self.list.isVisible() else []
+        self.balance_bubble.place(pet, screen, blocked)
 
     def _interact(self):
         self.machine.interact(time.monotonic_ns() // 1_000_000)
         if self.machine.state == PetState.WAKING: self.character.play_once("waking")
         else: self.character.set_state("idle")
     def _tick(self):
+        # Keep a displayed balance current even while the pointer rests on the pet.
+        if self.balance_bubble.isVisible(): self.refresh_balance_if_stale()
         if self.character.transient: return
         now = time.monotonic_ns() // 1_000_000
         if any((self.editor.isVisible(), self.list.isVisible(), self.chooser.isVisible(), self.chat_active)):
@@ -296,6 +360,8 @@ class PetWindow(QWidget):
         cursor = QCursor.pos(); self._move_visible(dialog, cursor.x() - dialog.width() // 2, cursor.y() - 30, self._screen_rect(cursor))
         if dialog.exec() == ApiConfigDialog.Accepted:
             self.chat_config = dialog.value(); self.chat_config_store.save(self.chat_config)
+            # A new key must show up on the next hover, not in 5 minutes.
+            self.balance = None; self.balance_error = ""; self.balance_fetched_at = 0.0
             self.tray.showMessage("聊天 API", "配置已保存，可以开始聊天。", QSystemTrayIcon.Information, 2500)
             return True
         return False
@@ -314,7 +380,7 @@ class PetWindow(QWidget):
         self.tasks = [t for t in self.tasks if t.id != task_id]; self.refresh(); self._save(); self.character.play_once("jumping")
 
     def hide_overlays(self):
-        self.list.hide(); self.editor.hide(); self.chooser.hide()
+        self.list.hide(); self.editor.hide(); self.chooser.hide(); self.balance_bubble.hide()
         if self.chat_active: self.end_chat()
         else: self.character.force_state("idle")
     def _schedule_hide(self): self.hide_timer.start(250)
@@ -352,7 +418,7 @@ class PetWindow(QWidget):
         except OSError: return False
 
     def quit(self):
-        self._save(); self.tray.hide(); self.list.hide(); self.editor.hide(); self.chooser.hide(); self.chat_input.hide(); self.bubble.hide()
+        self._save(); self.tray.hide(); self.list.hide(); self.editor.hide(); self.chooser.hide(); self.chat_input.hide(); self.bubble.hide(); self.balance_bubble.hide()
         QApplication.instance().removeEventFilter(self); QApplication.quit()
     def closeEvent(self, event): self.quit(); event.accept()
 

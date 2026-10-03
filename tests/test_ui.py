@@ -3,12 +3,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import json
 import unittest
 import tempfile
+import time
+from decimal import Decimal
 from unittest.mock import patch
 from datetime import datetime, timedelta
 from pathlib import Path
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QImage, QInputMethodEvent, QTextCursor
 from app.task_views import TaskEditor, TaskRow, TickCheckBox
+from app.balance_views import BalanceBubble
 from app.chat_views import ApiConfigDialog, ChatInputPanel, ChatRunner, SpeechBubble
 from app.global_hotkey import GlobalVisibilityHotkey
 from app.main_window import PetWindow
@@ -16,6 +19,7 @@ from app.character import CharacterWidget
 from core.models import Task
 from core.store import DataStore
 from core.character_pack import CharacterPack
+from core.balance import Balance
 from core.chat import ChatConfig
 
 app = QApplication.instance() or QApplication([])
@@ -447,4 +451,188 @@ class UiTests(unittest.TestCase):
             pet.chat_config_store.save(ChatConfig("https://example.test/v1", "model", "key"))
             pet.open_chat(); app.processEvents(); assert_visible(pet.chat_input)
             pet.bubble.begin(pet._bubble_anchor()); app.processEvents(); assert_visible(pet.bubble)
+            pet.tray.hide(); pet.close()
+
+    def test_balloon_sizes_the_amount_and_reports_failures(self):
+        bubble = BalanceBubble()
+        rich = Balance("CNY", Decimal("100000"), Decimal("0"), Decimal("100000"), True)
+        bubble.set_balance(rich)
+        rich_size = bubble.amount.font().pixelSize()
+        self.assertEqual(bubble.value_text, "¥100,000.00")
+        self.assertEqual(bubble.amount.text(), "¥100,000.00")
+        bubble.set_balance(Balance("CNY", Decimal("12.00"), Decimal("0"), Decimal("12.00"), True))
+        self.assertLess(bubble.amount.font().pixelSize(), rich_size)
+        self.assertEqual(bubble.value_text, "¥12.00")
+        bubble.set_balance(None, "API Key 无效或已失效，请在“配置聊天 API”中更新。")
+        self.assertEqual(bubble.value_text, "余额不可用")
+        self.assertIn("API Key", bubble.amount.toolTip())
+        bubble.close()
+
+    def test_balloon_keeps_a_pet_sized_ceiling(self):
+        bubble = BalanceBubble()
+        for value in ("0.00", "9.99", "150.00", "999999999.99"):
+            bubble.set_balance(Balance("CNY", Decimal(value), Decimal("0"), Decimal(value), True))
+            self.assertLessEqual(bubble.amount.font().pixelSize(), 40)
+            self.assertGreaterEqual(bubble.amount.font().pixelSize(), 15)
+            self.assertLessEqual(bubble.width(), 420)
+        bubble.close()
+
+    def test_balloon_shows_a_loading_state_before_the_first_answer(self):
+        bubble = BalanceBubble()
+        bubble.show_loading()
+        self.assertEqual(bubble.value_text, "查询中…")
+        bubble.close()
+
+    def test_hover_shows_the_balance_balloon_next_to_the_pet(self):
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner"):
+            pet = PetWindow(DataStore(folder)); pet.show_all()
+            pet.balance = Balance("CNY", Decimal("144.38"), Decimal("0"), Decimal("144.38"), True)
+            pet._hovered(True); app.processEvents()
+            self.assertTrue(pet.balance_bubble.isVisible())
+            self.assertEqual(pet.balance_bubble.value_text, "¥144.38")
+            screen = pet._screen_rect()
+            self.assertGreaterEqual(pet.balance_bubble.x(), screen.x)
+            self.assertLessEqual(pet.balance_bubble.x() + pet.balance_bubble.width(), screen.x + screen.width)
+            pet.hide_overlays(); self.assertFalse(pet.balance_bubble.isVisible())
+            pet.tray.hide(); pet.close()
+
+    def test_balance_refresh_respects_the_cache_ttl(self):
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner") as runner:
+            pet = PetWindow(DataStore(folder))
+            pet.balance = Balance("CNY", Decimal("5"), Decimal("0"), Decimal("5"), True)
+            pet.balance_fetched_at = time.monotonic()
+            pet.refresh_balance_if_stale()
+            runner.assert_not_called()
+            pet.balance_fetched_at = time.monotonic() - 10_000
+            pet.balance_runner = None
+            pet.refresh_balance_if_stale()
+            runner.assert_called_once()
+            pet.tray.hide(); pet.close()
+
+    def test_balance_failure_is_retried_rather_than_cached_forever(self):
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner") as runner:
+            pet = PetWindow(DataStore(folder))
+            pet.balance = None; pet.balance_error = "API Key 无效"
+            pet.balance_fetched_at = time.monotonic()
+            pet.refresh_balance_if_stale()
+            runner.assert_not_called()
+            pet.balance_fetched_at = time.monotonic() - 10_000
+            pet.balance_runner = None
+            pet.refresh_balance_if_stale()
+            runner.assert_called_once()
+            pet.tray.hide(); pet.close()
+
+    def test_leaving_the_pet_hides_the_balloon_with_the_other_overlays(self):
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner"):
+            pet = PetWindow(DataStore(folder)); pet.show_all()
+            pet._hovered(True); app.processEvents()
+            self.assertTrue(pet.balance_bubble.isVisible())
+            pet._hovered(False); pet._hide_overlays_if_outside()
+            self.assertFalse(pet.balance_bubble.isVisible())
+            pet.tray.hide(); pet.close()
+
+    def test_a_visible_balloon_keeps_refreshing_on_the_tick(self):
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner") as runner:
+            pet = PetWindow(DataStore(folder)); pet.show_all()
+            pet.balance = Balance("CNY", Decimal("5"), Decimal("0"), Decimal("5"), True)
+            pet.balance_fetched_at = time.monotonic() - 10_000
+            pet._hovered(True); app.processEvents()
+            runner.reset_mock(); pet.balance_runner = None
+            pet._tick()
+            runner.assert_called_once()          # a resting pointer still sees fresh numbers
+            pet.hide_overlays(); pet.balance_runner = None
+            pet._tick()
+            runner.assert_called_once()          # hidden balloon stops querying
+            pet.tray.hide(); pet.close()
+
+    def test_the_oval_holds_the_number_inside_its_curve(self):
+        """A manga oval cuts its corners: the digits must stay within the curve."""
+        bubble = BalanceBubble(); bubble.show(); app.processEvents()
+        for value in ("0.83", "126.47", "99999999.99"):
+            bubble.set_balance(Balance("CNY", Decimal(value), Decimal("0"), Decimal(value), True))
+            app.processEvents()
+            width, height = bubble.width(), bubble.height()
+            cx, cy, rx, ry = 2 + (width - 4) / 2, 2 + (height - 18) / 2, (width - 4) / 2, (height - 18) / 2
+            rect = bubble.amount.geometry(); mid = rect.center().y()
+            for x in (rect.left(), rect.right()):
+                self.assertLessEqual(((x - cx) / rx) ** 2 + ((mid - cy) / ry) ** 2, 1.0,
+                                     f"¥{value} at {width}x{height} pokes out of the oval")
+        bubble.close()
+
+
+def _send_mouse(widget, kind, global_pos, button, buttons):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    event = QMouseEvent(kind, QPointF(0, 0), QPointF(global_pos.x(), global_pos.y()), button, buttons, Qt.NoModifier)
+    QApplication.sendEvent(widget, event)
+
+
+def _press(widget, global_pos):
+    from PySide6.QtCore import QEvent, Qt
+    _send_mouse(widget, QEvent.MouseButtonPress, global_pos, Qt.LeftButton, Qt.LeftButton)
+
+
+def _move(widget, global_pos):
+    from PySide6.QtCore import QEvent, Qt
+    _send_mouse(widget, QEvent.MouseMove, global_pos, Qt.NoButton, Qt.LeftButton)
+
+
+def _release(widget, global_pos):
+    from PySide6.QtCore import QEvent, Qt
+    _send_mouse(widget, QEvent.MouseButtonRelease, global_pos, Qt.LeftButton, Qt.NoButton)
+
+
+class ChatDragTests(unittest.TestCase):
+    """The pet stays draggable mid-conversation, and the chat travels with it."""
+
+    def _chatting(self, folder):
+        pet = PetWindow(DataStore(folder)); pet.show_all()
+        pet.chat_active = True; pet.chat_input.open_panel(); pet._move_near_pet(pet.chat_input)
+        pet.character.set_state("waiting"); app.processEvents()
+        return pet
+
+    def test_dragging_while_chatting_moves_pet_and_panels_without_ending_the_chat(self):
+        from PySide6.QtCore import QPoint
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner"):
+            pet = self._chatting(folder)
+            panel_offset = (pet.chat_input.x() - pet.x(), pet.chat_input.y() - pet.y())
+            _press(pet.character, QPoint(600, 400)); _move(pet.character, QPoint(650, 400))
+            first_pet = pet.pos()
+            _move(pet.character, QPoint(680, 420))
+            self.assertEqual((pet.x(), pet.y()), (first_pet.x() + 30, first_pet.y() + 20))
+            self.assertEqual((pet.chat_input.x() - pet.x(), pet.chat_input.y() - pet.y()), panel_offset)
+            _release(pet.character, QPoint(680, 420))
+            self.assertTrue(pet.chat_active)                                # the chat is untouched
+            self.assertEqual(pet.character.state, "waiting")                # no running animation
+            self.assertEqual(pet.settings["pet_position"], [pet.x(), pet.y()])
+            pet.tray.hide(); pet.close()
+
+    def test_dragging_carries_the_message_balloon(self):
+        from PySide6.QtCore import QPoint
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner"):
+            pet = self._chatting(folder)
+            pet.bubble.begin(pet._bubble_anchor()); pet.bubble.enqueue("回复正在流式输出"); app.processEvents()
+            _press(pet.character, QPoint(600, 400)); _move(pet.character, QPoint(650, 400))
+            first = pet.bubble.pos()
+            _move(pet.character, QPoint(690, 400))
+            self.assertEqual(pet.bubble.pos(), first + QPoint(40, 0))       # balloon followed the pet
+            self.assertEqual(pet.bubble.anchor, pet._bubble_anchor())       # anchor stays truthful
+            pet.bubble.reveal_timer.stop(); pet.tray.hide(); pet.close()
+
+    def test_clicking_the_pet_while_chatting_does_not_open_the_chooser(self):
+        from PySide6.QtCore import QPoint
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner"):
+            pet = self._chatting(folder)
+            _press(pet.character, QPoint(600, 400)); _release(pet.character, QPoint(600, 400))
+            self.assertFalse(pet.chooser.isVisible())
+            self.assertTrue(pet.chat_active)
+            self.assertTrue(pet.chat_input.isVisible())
+            pet.tray.hide(); pet.close()
+
+    def test_a_click_outside_a_chat_still_opens_the_chooser(self):
+        from PySide6.QtCore import QPoint
+        with tempfile.TemporaryDirectory() as folder, patch("app.main_window.BalanceRunner"):
+            pet = PetWindow(DataStore(folder)); pet.show_all(); app.processEvents()
+            _press(pet.character, QPoint(600, 400)); _release(pet.character, QPoint(600, 400))
+            self.assertTrue(pet.chooser.isVisible())
             pet.tray.hide(); pet.close()

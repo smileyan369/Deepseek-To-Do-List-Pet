@@ -64,7 +64,7 @@ class ApiConfigDialog(QDialog):
         layout = QVBoxLayout(panel); layout.setContentsMargins(16, 13, 16, 13); layout.setSpacing(9)
         title = QLabel("配置聊天 API"); title.setStyleSheet("font-size:15px;font-weight:600;color:#132a56;")
         form = QFormLayout(); form.setHorizontalSpacing(10); form.setVerticalSpacing(8)
-        self.base_url = QLineEdit(config.base_url); self.base_url.setPlaceholderText("https://api.openai.com/v1")
+        self.base_url = QLineEdit(config.base_url); self.base_url.setPlaceholderText("https://api.deepseek.com/v1")
         self.model = QLineEdit(config.model); self.model.setPlaceholderText("模型名称")
         self.api_key = QLineEdit(config.api_key); self.api_key.setEchoMode(QLineEdit.Password); self.api_key.setPlaceholderText("API Key")
         form.addRow("接口地址", self.base_url); form.addRow("模型", self.model); form.addRow("API Key", self.api_key)
@@ -205,6 +205,12 @@ class SpeechBubble(QWidget):
     def set_anchor(self, anchor: QPoint):
         self.anchor = QPoint(anchor)
         if self.isVisible(): self._resize_and_anchor()
+
+    def nudge(self, dx: int, dy: int):
+        """Follow a moving pet without re-measuring the revealed text."""
+        if not self.isVisible(): return
+        self.anchor += QPoint(dx, dy)
+        self.move(self.x() + dx, self.y() + dy)
 
     def _resize_and_anchor(self):
         metrics = QFontMetrics(self.text.font())
