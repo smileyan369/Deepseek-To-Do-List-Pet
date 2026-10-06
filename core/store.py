@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from .models import Task
 
 DEFAULT_SETTINGS = {"pet_position": None, "hidden": False, "autostart": False}
@@ -39,11 +38,14 @@ class DataStore:
                 self.backup.write_bytes(self.path.read_bytes())
             except (OSError, ValueError):
                 pass
-        with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=self.data_dir,
-                                prefix="data.", suffix=".tmp") as temp:
-            temp.write(payload)
-            temp_name = temp.name
-        os.replace(temp_name, self.path)
+        # A deterministic temp name, NOT tempfile.NamedTemporaryFile: on Windows
+        # tempfile retries a permission failure up to 2**31-1 times (TMP_MAX is
+        # os.TMP_MAX there), so an unwritable data directory turned a startup save
+        # into an invisible infinite hang with no window and no error. Writing a
+        # fixed name raises immediately instead, and os.replace stays atomic.
+        temp_path = self.path.with_name(self.path.name + ".tmp")
+        temp_path.write_text(payload, encoding="utf-8")
+        os.replace(temp_path, self.path)
         # Establish an initial recovery point on the first successful write.
         if not self.backup.exists():
             self.backup.write_bytes(self.path.read_bytes())

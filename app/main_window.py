@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 from PySide6.QtCore import QEvent, QPoint, QTimer, Qt
-from PySide6.QtGui import QAction, QCursor, QIcon
+from PySide6.QtGui import QAction, QCursor, QGuiApplication, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 from app.balance_views import BalanceBubble, BalanceRunner
 from app.character import CharacterWidget, asset_path
@@ -15,10 +15,13 @@ from app.task_views import TaskEditor, TaskList
 from core.animation import AnimationStateMachine, PetState
 from core.chat import ChatConfigStore, ChatMemory
 from core.character_pack import CharacterPack, discover_character_packs, write_workshop_template
+from core.diagnostics import log_line
 from core.interaction import classify_press
 from core.models import Task, sorted_tasks
 from core.positioning import Rect, fit_overlay_position, restore_position
-from core.single_instance import SingleInstanceGuard
+from core.runtime_guard import cleanup_stale_extractions
+from core.single_instance import (SingleInstanceGuard, create_show_request_event,
+                                  request_show_existing, take_show_request)
 from core.store import DataStore
 
 
@@ -150,7 +153,12 @@ class PetWindow(QWidget):
             y = self.y() - widget.height() + 5
         self._move_visible(widget, x, y, screen)
 
-    def _save(self): self.store.save(self.tasks, self.settings)
+    def _save(self):
+        try:
+            self.store.save(self.tasks, self.settings)
+        except OSError as exc:
+            # A failed save must never stop the pet from starting or running.
+            log_line(f"保存数据失败（{exc}），本次修改不会被记住。")
     def refresh(self): self.list.set_tasks(sorted_tasks(self.tasks))
 
     def eventFilter(self, watched, event):
@@ -423,17 +431,46 @@ class PetWindow(QWidget):
     def closeEvent(self, event): self.quit(); event.accept()
 
 
+def _handle_show_request(window: "PetWindow", handle) -> None:
+    if take_show_request(handle):
+        log_line("收到二次启动的显示请求，重新显示桌宠。")
+        window.show_all()
+        window.raise_()
+        window.activateWindow()
+
+
 def run():
     instance = SingleInstanceGuard()
     if not instance.acquire():
+        # A second launch used to exit silently, which is indistinguishable from a
+        # broken app ("double-clicked and nothing happened"). Ask the running pet to
+        # show itself, and only fall back to a dialog when no instance answers.
+        log_line("检测到另一个桌宠实例，已请求它显示窗口，本次启动退出。")
+        if not request_show_existing():
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None, "桌宠已经在运行了：看桌面上的角色或右下角系统托盘。", "待办桌宠", 0x40)
+            except Exception:
+                pass
         return
+    # With the mutex held, any other extraction directory belongs to a dead run.
+    cleanup_stale_extractions()
     app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False); app.setApplicationName("待办桌宠")
     app.setWindowIcon(QIcon(str(asset_path("assets/app-icon.png"))))
     window = PetWindow(startup_launch="--autostart" in sys.argv[1:]); app.aboutToQuit.connect(window.tray.hide)
+    show_event = create_show_request_event()
+    if show_event:
+        show_poll = QTimer(window); show_poll.setInterval(500)
+        show_poll.timeout.connect(lambda: _handle_show_request(window, show_event))
+        show_poll.start()
     visibility_hotkey = GlobalVisibilityHotkey(app, window.toggle_hidden)
     if not visibility_hotkey.register():
         window.tray.showMessage("快捷键不可用", "Ctrl+Shift+Z 已被其他程序占用，桌宠仍可通过托盘显示或隐藏。", QSystemTrayIcon.Warning, 4000)
     app.aboutToQuit.connect(visibility_hotkey.unregister)
+    log_line(f"启动成功 pid={os.getpid()} exe={sys.executable} "
+             f"解压目录={getattr(sys, '_MEIPASS', '(源码运行)')} "
+             f"屏幕={len(QGuiApplication.screens())} 位置=({window.x()},{window.y()})")
     try:
         sys.exit(app.exec())
     finally:

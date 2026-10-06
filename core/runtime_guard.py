@@ -18,7 +18,9 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
+import shutil
 import sys
+import time
 import zipfile
 
 
@@ -124,3 +126,45 @@ def was_runtime_removed(exc: BaseException) -> bool:
 
 def removed_runtime_hint() -> str:
     return REMOVED_RUNTIME_HINT
+
+
+# Leftover extraction directories older than this are safe to delete: nothing can
+# still be starting from them, because a launch extracts and reaches the mutex
+# within seconds.
+STALE_EXTRACTION_AGE_SECONDS = 3600.0
+
+
+def cleanup_stale_extractions(max_age_seconds: float = STALE_EXTRACTION_AGE_SECONDS) -> int:
+    """Remove `_MEI*` leftovers from forcibly closed earlier runs.
+
+    Only meaningful for a frozen one-file build, and only called while the
+    single-instance mutex is held — so any extraction directory other than our own
+    belongs to a process that is no longer running. Directories younger than
+    `max_age_seconds` are kept: they may belong to a launch that has extracted but
+    not yet taken the mutex. Every failure is ignored; foreign files are never
+    touched (entries must start with `_MEI`).
+    """
+    if not getattr(sys, "frozen", False):
+        return 0
+    root = extraction_root()
+    if root is None:
+        return 0
+    parent = root.parent
+    if not parent.is_dir():
+        return 0
+    removed = 0
+    cutoff = time.time() - max_age_seconds
+    for entry in parent.iterdir():
+        if entry.name == root.name or not entry.name.startswith("_MEI"):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if entry.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                removed += 1
+        except OSError:
+            continue
+    return removed

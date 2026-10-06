@@ -1,3 +1,4 @@
+import os
 import py_compile
 import tempfile
 import unittest
@@ -15,7 +16,9 @@ from core.animation import AnimationStateMachine, PetState
 from core.character_pack import CharacterPack, discover_character_packs, write_workshop_template
 from core.chat import (BingRssSearchClient, ChatApiError, ChatConfig, ChatConfigStore, ChatMemory,
                        OpenAICompatibleClient, SYSTEM_PROMPT, So360SearchClient, WebSearchClient,
-                       add_web_search_context, needs_web_search)
+                       add_web_search_context, is_deepseek_endpoint, needs_web_search)
+from core.native_chat import (DeepSeekNativeClient, UrlRedactor, is_transient_error,
+                              strip_urls)
 from core import runtime_guard
 from core.balance import (MAX_FONT_PX, MIN_FONT_PX, DeepSeekBalanceClient, balance_endpoint,
                           balance_font_px, parse_balance)
@@ -464,3 +467,247 @@ class SearchSourceTests(unittest.TestCase):
             self.assertTrue(needs_web_search(query), query)
         for query in ("内联函数是什么", "再讲一遍", "你好"):
             self.assertFalse(needs_web_search(query), query)
+
+
+class RuntimeCleanupTests(unittest.TestCase):
+    """Stale extraction leftovers go; recent ones, our own, and files stay."""
+
+    def test_removes_only_old_sibling_mei_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            own = runtime / "_MEIcurrent"
+            own.mkdir(parents=True)
+            old = runtime / "_MEIold001"
+            old.mkdir()
+            (old / "base_library.zip").write_bytes(b"x")
+            fresh = runtime / "_MEInew002"
+            fresh.mkdir()
+            keep = runtime / "keep-me.txt"
+            keep.write_text("data", encoding="utf-8")
+            stale = time.time() - 7200
+            os.utime(old, (stale, stale))
+            with patch.object(runtime_guard.sys, "frozen", True, create=True), \
+                    patch.object(runtime_guard.sys, "_MEIPASS", str(own), create=True):
+                removed = runtime_guard.cleanup_stale_extractions()
+            self.assertEqual(removed, 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(keep.exists())
+            self.assertTrue(own.exists())
+
+    def test_noop_when_running_from_source(self):
+        with patch.object(runtime_guard.sys, "frozen", False, create=True):
+            self.assertEqual(runtime_guard.cleanup_stale_extractions(), 0)
+
+
+class StoreSaveTests(unittest.TestCase):
+    """A save that cannot write must fail fast, never retry forever."""
+
+    def test_save_raises_promptly_when_directory_is_unusable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "afile"
+            blocker.write_text("x", encoding="utf-8")
+            store = DataStore(blocker / "sub")
+            start = time.time()
+            with self.assertRaises(OSError):
+                store.save([], {})
+            self.assertLess(time.time() - start, 2.0)
+
+    def test_save_and_reload_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DataStore(Path(tmp))
+            tasks = [task("买菜", None, 1)]
+            store.save(tasks, {"hidden": True})
+            loaded, settings = store.load()
+            self.assertEqual([t.name for t in loaded], ["买菜"])
+            self.assertTrue(settings["hidden"])
+
+
+class _FakeResponse:
+    """Minimal urlopen stand-in: iterating gives SSE lines, read() gives JSON."""
+
+    def __init__(self, lines, content_type="text/event-stream"):
+        self._lines = [line.encode("utf-8") for line in lines]
+        self.headers = {"Content-Type": content_type}
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def read(self):
+        return b"".join(self._lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def _sse(*events):
+    return [f"data: {json.dumps(event, ensure_ascii=False)}" for event in events]
+
+
+def _text_start(index=0):
+    return {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}
+
+
+class UrlRedactionTests(unittest.TestCase):
+    """流式保险丝：网址和链接目标不能出现在界面上，连半帧都不行。"""
+
+    def test_complete_url_is_swallowed(self):
+        redactor = UrlRedactor()
+        out = redactor.feed("看这里 https://example.com/a 很好") + redactor.flush()
+        self.assertNotIn("example.com", out)
+        self.assertIn("很好", out)
+
+    def test_url_split_across_chunks_is_swallowed(self):
+        redactor = UrlRedactor()
+        out = redactor.feed("看 http://exa")
+        out += redactor.feed("mple.com/path 完了")
+        out += redactor.flush()
+        self.assertNotIn("mple.com", out)
+        self.assertNotIn("exa", out)
+        self.assertIn("完了", out)
+
+    def test_partial_marker_tail_is_held_until_it_can_be_judged(self):
+        redactor = UrlRedactor()
+        self.assertEqual(redactor.feed("答案是 htt"), "答案是 ")
+        rest = redactor.feed("ps://x.cn 好的")
+        self.assertNotIn("x.cn", rest)
+        self.assertIn("好的", rest)
+
+    def test_markdown_link_becomes_plain_label(self):
+        redactor = UrlRedactor()
+        out = redactor.feed("[中新网](https://news.example/a)报道") + redactor.flush()
+        self.assertIn("中新网", out)
+        self.assertNotIn("[", out)
+        self.assertNotIn("news.example", out)
+
+    def test_flush_drops_an_unfinished_url(self):
+        redactor = UrlRedactor()
+        redactor.feed("结尾 https://never.finishes")
+        self.assertEqual(strip_urls(redactor.flush()), "")
+
+    def test_normal_text_with_brackets_survives(self):
+        redactor = UrlRedactor()
+        out = redactor.feed("列表[1]、[2]和数字 42") + redactor.flush()
+        self.assertIn("[1]", out)
+        self.assertIn("42", out)
+
+    def test_final_strip_keeps_link_labels(self):
+        self.assertEqual(strip_urls("见 [标题](https://a.example/c) 和 https://d.example/f 结束"),
+                         "见 标题 和 结束")
+
+
+class NativeSearchTests(unittest.TestCase):
+    """DeepSeek 官方服务端搜索的流式解析、pause_turn 续接与错误分类。"""
+
+    def _config(self, **overrides):
+        fields = dict(base_url="https://api.deepseek.com/v1", model="deepseek-flash",
+                      api_key="key", web_search=True)
+        fields.update(overrides)
+        return ChatConfig(**fields)
+
+    def test_streams_only_text_and_hides_thinking_and_tool_blocks(self):
+        events = [
+            {"type": "message_start"},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "thinking_delta", "thinking": "内部思考"}},
+            {"type": "content_block_start", "index": 1,
+             "content_block": {"type": "server_tool_use", "id": "t1", "name": "web_search"}},
+            {"type": "content_block_delta", "index": 1,
+             "delta": {"type": "input_json_delta", "partial_json": '{"query": "x"}'}},
+            _text_start(2),
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "今天"}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "不错"}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+        with patch("core.native_chat.urlopen", return_value=_FakeResponse(_sse(*events))):
+            chunks = list(DeepSeekNativeClient(self._config()).stream(
+                [{"role": "user", "content": "hi"}]))
+        self.assertEqual(chunks, ["今天", "不错"])
+
+    def test_system_moves_to_top_level_and_tools_follow_the_toggle(self):
+        events = [_text_start(0),
+                  {"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "ok"}},
+                  {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+                  {"type": "message_stop"}]
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse(_sse(*events))
+
+        with patch("core.native_chat.urlopen", side_effect=fake_urlopen):
+            list(DeepSeekNativeClient(self._config()).stream(
+                [{"role": "system", "content": "规则"}, {"role": "user", "content": "hi"}]))
+            list(DeepSeekNativeClient(self._config(web_search=False)).stream(
+                [{"role": "user", "content": "hi"}]))
+        self.assertEqual(calls[0]["system"], "规则")
+        self.assertEqual([m["role"] for m in calls[0]["messages"]], ["user"])
+        self.assertEqual(calls[0]["tools"][0]["type"], "web_search_20250305")
+        self.assertNotIn("tools", calls[1])
+
+    def test_pause_turn_continues_with_assistant_blocks_without_repeating_text(self):
+        first = [
+            _text_start(0),
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "正在查"}},
+            {"type": "content_block_start", "index": 1,
+             "content_block": {"type": "server_tool_use", "id": "t1", "name": "web_search"}},
+            {"type": "content_block_delta", "index": 1,
+             "delta": {"type": "input_json_delta", "partial_json": '{"query": "德杯"}'}},
+            {"type": "message_delta", "delta": {"stop_reason": "pause_turn"}},
+            {"type": "message_stop"},
+        ]
+        second = [
+            _text_start(0),
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "结果是 3 比 1"}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse(_sse(*(first if len(calls) == 1 else second)))
+
+        with patch("core.native_chat.urlopen", side_effect=fake_urlopen):
+            chunks = list(DeepSeekNativeClient(self._config()).stream(
+                [{"role": "user", "content": "hi"}]))
+        self.assertEqual(chunks, ["正在查", "结果是 3 比 1"])
+        self.assertEqual(len(calls), 2)
+        continuation = calls[1]["messages"][-1]
+        self.assertEqual(continuation["role"], "assistant")
+        types = [block["type"] for block in continuation["content"]]
+        self.assertIn("server_tool_use", types)
+        tool_block = next(b for b in continuation["content"] if b["type"] == "server_tool_use")
+        self.assertEqual(tool_block["input"], {"query": "德杯"})
+
+    def test_error_classification_and_endpoint_detection(self):
+        self.assertFalse(is_transient_error(ChatApiError("API 请求失败（HTTP 401）: invalid key")))
+        self.assertFalse(is_transient_error(ChatApiError("API 请求失败（HTTP 400）")))
+        self.assertTrue(is_transient_error(ChatApiError("API 请求失败（HTTP 500）")))
+        self.assertTrue(is_transient_error(ChatApiError("API 请求失败（HTTP 429）")))
+        self.assertTrue(is_transient_error(ChatApiError("无法连接聊天 API：timed out")))
+        self.assertTrue(is_deepseek_endpoint("https://api.deepseek.com/v1"))
+        self.assertFalse(is_deepseek_endpoint("https://api.example.test/v1"))
+
+    def test_reasoning_effort_is_only_sent_to_deepseek(self):
+        payloads = []
+
+        def fake_urlopen(request, timeout=None):
+            payloads.append(json.loads(request.data.decode("utf-8")))
+            return _FakeResponse(['data: {"choices":[{"delta":{"content":"hi"}}]}', "data: [DONE]"])
+
+        with patch("core.chat.urlopen", side_effect=fake_urlopen):
+            list(OpenAICompatibleClient().stream(
+                ChatConfig("https://api.deepseek.com/v1", "deepseek-flash", "key"),
+                [{"role": "user", "content": "x"}]))
+            list(OpenAICompatibleClient().stream(
+                ChatConfig("https://api.example.test/v1", "model", "key"),
+                [{"role": "user", "content": "x"}]))
+        self.assertEqual(payloads[0].get("reasoning_effort"), "none")
+        self.assertNotIn("reasoning_effort", payloads[1])

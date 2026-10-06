@@ -8,4 +8,14 @@ a = Analysis(['main.py'], pathex=[], binaries=[], datas=datas, hiddenimports=hid
 pyz = PYZ(a.pure)
 # upx=False: UPX-packed DLLs make antivirus and temp cleaners more likely to touch
 # the extraction directory this app depends on.
-exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='待办桌宠', icon='assets/app.ico', debug=False, bootloader_ignore_signals=False, strip=False, upx=False, console=False)
+#
+# runtime_tmpdir: the single-file bootloader unpacks its whole runtime before any
+# Python code runs, and it defaults to %TEMP%\_MEIxxxxxx. On this machine %TEMP% is
+# actively cleaned (4.5 GB observed, and _MEI directories were being removed while a
+# launch was in flight), which surfaced as "Could not create temporary directory!"
+# from the bootloader. Unpacking under the app's own LOCALAPPDATA tree keeps the
+# extraction away from temp cleaners and out of the roaming profile; the bootloader
+# expands the environment variable at run time. PyInstaller 6 passes this through
+# to the bootloader as an OPTION entry (verified working in the built exe).
+runtime_tmpdir = r'%LOCALAPPDATA%\深海待办桌宠\runtime'
+exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='待办桌宠', icon='assets/app.ico', debug=False, bootloader_ignore_signals=False, strip=False, upx=False, console=False, runtime_tmpdir=runtime_tmpdir)

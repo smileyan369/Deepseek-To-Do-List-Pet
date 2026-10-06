@@ -432,6 +432,35 @@ class UiTests(unittest.TestCase):
         self.assertEqual(scrollbar.value(), scrollbar.maximum())
         bubble.close()
 
+    def test_markdown_answers_are_rendered_not_shown_as_source(self):
+        from PySide6.QtCore import QPoint
+        bubble = SpeechBubble(); bubble.begin(QPoint(500, 400))
+        bubble.enqueue("**重点**：下面是清单\n\n- 第一条\n- 第二条")
+        for _ in range(60):
+            if not bubble.pending:
+                break
+            bubble._drain()
+        rendered = bubble.text.toPlainText()
+        self.assertIn("重点", rendered)
+        self.assertNotIn("**", rendered)
+        self.assertIn("第一条", rendered)
+        bubble.close()
+
+    def test_answer_reveals_by_catching_up_not_one_char_a_tick(self):
+        """The old 38ms-per-character tick made a 300-char answer crawl for 11s."""
+        from PySide6.QtCore import QPoint
+        bubble = SpeechBubble(); bubble.begin(QPoint(500, 400))
+        bubble.enqueue("字" * 300)
+        bubble._drain()
+        self.assertGreaterEqual(len(bubble.full_text), 100)
+        for _ in range(60):
+            if not bubble.pending:
+                break
+            bubble._drain()
+        self.assertEqual(len(bubble.full_text), 300)
+        self.assertEqual(bubble.pending, "")
+        bubble.close()
+
     def test_overlays_are_kept_inside_current_screen(self):
         with tempfile.TemporaryDirectory() as folder:
             pet = PetWindow(DataStore(folder)); available = app.primaryScreen().availableGeometry()

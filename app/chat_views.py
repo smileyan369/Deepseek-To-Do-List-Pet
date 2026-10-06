@@ -12,7 +12,9 @@ from PySide6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget,
 )
 
-from core.chat import ChatApiError, ChatConfig, OpenAICompatibleClient, WebSearchClient, add_search_failure_context, add_web_search_context, is_current_time_query, needs_web_search
+from core.chat import ChatApiError, ChatConfig, OpenAICompatibleClient, WebSearchClient, add_search_failure_context, add_web_search_context, is_current_time_query, is_deepseek_endpoint, needs_web_search
+from core.diagnostics import log_line
+from core.native_chat import DeepSeekNativeClient, UrlRedactor, is_transient_error, strip_urls
 from core.positioning import Rect, fit_overlay_position
 
 
@@ -164,7 +166,15 @@ class ChatTextInput(QTextEdit):
 
 
 class SpeechBubble(QWidget):
-    """Bottom-anchored bubble that reveals streamed text one character at a time."""
+    """Bottom-anchored bubble that reveals streamed text one character at a time.
+
+    The reveal chases the backlog instead of one char per tick: the old 38ms/char
+    (about 26 chars per second) made a 300-char answer take 11 extra seconds after
+    the API had already finished sending it.
+    """
+    REVEAL_INTERVAL_MS = 24
+    FRACTION_PER_TICK = 0.34
+    MAX_CHARS_PER_TICK = 240
 
     def __init__(self):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
@@ -173,7 +183,10 @@ class SpeechBubble(QWidget):
         self.text = QTextEdit(self); self.text.setReadOnly(True); self.text.setFrameStyle(0)
         self.text.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded); self.text.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.text.setStyleSheet("QTextEdit{background:transparent;color:#132a56;border:none;font-size:13px;} QScrollBar:vertical{width:7px;background:transparent;margin:5px 1px 5px 0;} QScrollBar::handle:vertical{background:#7bcce7;border-radius:3px;min-height:22px;} QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}")
-        self.reveal_timer = QTimer(self); self.reveal_timer.setInterval(38); self.reveal_timer.timeout.connect(self._reveal_one)
+        # Answers arrive as Markdown; render it, with modest heading sizes so a
+        # "## 标题" does not dominate the little bubble.
+        self.text.document().setDefaultStyleSheet("h1{font-size:16px;}h2,h3,h4{font-size:14px;}")
+        self.reveal_timer = QTimer(self); self.reveal_timer.setInterval(self.REVEAL_INTERVAL_MS); self.reveal_timer.timeout.connect(self._drain)
         self.setFixedSize(148, 70)
 
     def begin(self, anchor: QPoint):
@@ -193,12 +206,16 @@ class SpeechBubble(QWidget):
         """Keep the completed reply in the scrollable text area."""
         self.text.ensureCursorVisible()
 
-    def _reveal_one(self):
+    def _drain(self):
         if not self.pending:
             self.reveal_timer.stop()
             return
-        self.full_text += self.pending[0]; self.pending = self.pending[1:]
-        self.text.setPlainText(self.full_text)
+        count = max(1, int(len(self.pending) * self.FRACTION_PER_TICK))
+        count = min(count, len(self.pending), self.MAX_CHARS_PER_TICK)
+        self.full_text += self.pending[:count]; self.pending = self.pending[count:]
+        # Render Markdown as it arrives; Qt re-parses the partial text each tick
+        # and an unfinished "**" simply stays literal until it is closed.
+        self.text.setMarkdown(self.full_text)
         cursor = self.text.textCursor(); cursor.movePosition(QTextCursor.End); self.text.setTextCursor(cursor)
         self._resize_and_anchor(); self.text.ensureCursorVisible()
 
@@ -237,14 +254,32 @@ class SpeechBubble(QWidget):
         painter.drawEllipse(QRectF(9, self.height() - 13, 9, 7))
 
 
+def _with_current_time_note(messages: list[dict]) -> list[dict]:
+    """Every request carries today's date and the house rules for fresh facts."""
+    now = datetime.now().astimezone()
+    note = (
+        f"\n\n【当前时间】现在是 {now:%Y年%m月%d日} {now:%H:%M}（本机本地时间）。"
+        "涉及“今天/最新/近期”的问题以这个时间为准，不要把搜索结果里的旧日期当成今天。"
+        "回答中不要输出任何网址、域名、Markdown 链接或引用编号，直接给出结论。"
+        "可以用简洁的 Markdown（加粗、短列表，会被正常渲染显示），但不要用表格。"
+    )
+    copied = [dict(item) for item in messages]
+    if copied and copied[0].get("role") == "system":
+        copied[0]["content"] = str(copied[0]["content"]) + note
+    else:
+        copied.insert(0, {"role": "system", "content": note.strip()})
+    return copied
+
+
 class ChatRunner(QObject):
     chunk = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, config: ChatConfig, messages: list[dict], client=None, search_client=None):
+    def __init__(self, config: ChatConfig, messages: list[dict], client=None, search_client=None, native_client=None):
         super().__init__(); self.config = config; self.messages = messages
-        self.client = client or OpenAICompatibleClient(); self.search_client = search_client or WebSearchClient(config.search_api_key); self.cancelled = False
+        self.client = client or OpenAICompatibleClient(); self.search_client = search_client or WebSearchClient(config.search_api_key)
+        self.native_client = native_client; self.cancelled = False
 
     def cancel(self):
         self.cancelled = True
@@ -255,23 +290,52 @@ class ChatRunner(QObject):
     def _run(self):
         parts: list[str] = []
         try:
-            messages = self.messages
+            messages = _with_current_time_note(self.messages)
             query = next((item.get("content", "") for item in reversed(messages) if item.get("role") == "user"), "")
             if is_current_time_query(query):
                 now = datetime.now().astimezone().strftime("%Y年%m月%d日 %H:%M（本机本地时间）")
                 messages = messages[:-1] + [{"role": "system", "content": f"当前本机时间是：{now}。请直接用这个时间回答，不要联网搜索。"}, messages[-1]]
-            elif self.config.web_search and needs_web_search(query):
+            redactor = UrlRedactor()
+            native = self.native_client
+            if native is None and is_deepseek_endpoint(self.config.base_url) and self.config.model.strip():
+                # DeepSeek's own endpoint: the model searches on the server when it
+                # decides to, so there is nothing to scrape and no URLs to show.
+                native = DeepSeekNativeClient(self.config)
+            if native is not None:
                 try:
-                    messages = add_web_search_context(messages, query, self.search_client)
+                    for chunk in native.stream(messages):
+                        if self.cancelled:
+                            return
+                        safe = redactor.feed(chunk)
+                        if safe:
+                            parts.append(safe); self.chunk.emit(safe)
                 except ChatApiError as exc:
-                    messages = add_search_failure_context(messages, str(exc))
-            for chunk in self.client.stream(self.config, messages):
-                if self.cancelled:
-                    return
-                parts.append(chunk); self.chunk.emit(chunk)
+                    # Half an answer already went out: report the interruption
+                    # instead of silently restarting. Config errors (401/403/4xx)
+                    # are surfaced too — falling back would mask them.
+                    if parts or not is_transient_error(exc):
+                        raise
+                    log_line(f"原生联网失败，改用备用搜索链路：{exc}")
+                    native = None
+                    redactor = UrlRedactor()
+            if native is None:
+                if self.config.web_search and needs_web_search(query):
+                    try:
+                        messages = add_web_search_context(messages, query, self.search_client)
+                    except ChatApiError as exc:
+                        messages = add_search_failure_context(messages, str(exc))
+                for chunk in self.client.stream(self.config, messages):
+                    if self.cancelled:
+                        return
+                    safe = redactor.feed(chunk)
+                    if safe:
+                        parts.append(safe); self.chunk.emit(safe)
+            tail = redactor.flush()
+            if tail:
+                parts.append(tail); self.chunk.emit(tail)
             if self.cancelled:
                 return
-            answer = "".join(parts).strip()
+            answer = strip_urls("".join(parts)).strip()
             if not answer:
                 raise RuntimeError("API 没有返回可显示的内容")
             self.finished.emit(answer)
